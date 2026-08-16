@@ -83,7 +83,7 @@ your machine                 the service              your Modal account
 ## Install
 
 ```bash
-pi install npm:yaeger-pi               # once published to npm
+pi install npm:yaeger                  # once published to npm
 pi install git:github.com/saridsa2/yaeger
 ```
 
