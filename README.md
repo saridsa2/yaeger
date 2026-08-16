@@ -77,15 +77,20 @@ your machine                 the service              your Modal account
 
 ## Requirements
 
-* pi, and Node 22+
+* pi, and Node 22+ (the Modal SDK requires it)
 * A Modal account **for whoever starts an endpoint**. Team members need none.
 
 ## Install
 
 ```bash
-mkdir -p ~/.pi/agent/extensions/yaeger
-cp plugin/*.ts plugin/package.json ~/.pi/agent/extensions/yaeger/
-cd ~/.pi/agent/extensions/yaeger && npm install
+pi install npm:@saridsa2/yaeger-pi     # once published to npm
+pi install git:github.com/saridsa2/yaeger
+```
+
+Or try it for a single session without installing:
+
+```bash
+pi -e git:github.com/saridsa2/yaeger
 ```
 
 Then `/yaeger-login` in pi.

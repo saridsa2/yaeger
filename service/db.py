@@ -151,6 +151,22 @@ class ModelRequest(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
+class SigninAttempt(Base):
+    """Rate-limit ledger for the one unauthenticated, cost-bearing endpoint.
+
+    /v1/auth/email sends real email to an arbitrary address. Left open it is a
+    spam relay and a fast way to lose SMTP reputation, so both the address and
+    the caller IP are capped per hour.
+    """
+
+    __tablename__ = "signin_attempts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    email: Mapped[str] = mapped_column(String(255), index=True)
+    ip: Mapped[str | None] = mapped_column(String(64), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+
+
 class Team(Base):
     """A group sharing one endpoint, one index, and one bill.
 

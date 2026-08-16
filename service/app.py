@@ -14,9 +14,9 @@ from __future__ import annotations
 
 import os
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -32,6 +32,7 @@ from db import (
     KBEntry,
     ModelRequest,
     SessionLocal,
+    SigninAttempt,
     SigninToken,
     Usage,
     init_db,
@@ -343,14 +344,47 @@ class TokenRequest(BaseModel):
     token: str
 
 
+# Deliberately tight: a human signing in needs one code, maybe two after a
+# typo. Anything beyond that is abuse, and this endpoint spends real money.
+SIGNIN_PER_EMAIL_PER_HOUR = int(os.environ.get("YAEGERPI_SIGNIN_PER_EMAIL_HOUR", "3"))
+SIGNIN_PER_IP_PER_HOUR = int(os.environ.get("YAEGERPI_SIGNIN_PER_IP_HOUR", "10"))
+
+
 @app.post("/v1/auth/email")
-def auth_email(req: EmailRequest, db: Session = Depends(get_db)):
+def auth_email(request: Request, req: EmailRequest, db: Session = Depends(get_db)):
     """Email a single-use sign-in code. Always reports success: whether an
     address has an account is not something an unauthenticated caller should
     be able to probe."""
     email = req.email.strip().lower()
     if "@" not in email or len(email) > 255:
         raise HTTPException(400, "invalid email")
+
+    # nginx sits in front, so the real caller is in X-Forwarded-For.
+    fwd = request.headers.get("x-forwarded-for", "")
+    ip = (fwd.split(",")[0].strip() if fwd else None) or (
+        request.client.host if request.client else None
+    )
+
+    hour_ago = utcnow() - timedelta(hours=1)
+    by_email = db.scalar(
+        select(func.count()).select_from(SigninAttempt).where(
+            SigninAttempt.email == email, SigninAttempt.created_at >= hour_ago
+        )
+    ) or 0
+    if by_email >= SIGNIN_PER_EMAIL_PER_HOUR:
+        raise HTTPException(429, "too many sign-in codes requested for this address; try later")
+
+    if ip:
+        by_ip = db.scalar(
+            select(func.count()).select_from(SigninAttempt).where(
+                SigninAttempt.ip == ip, SigninAttempt.created_at >= hour_ago
+            )
+        ) or 0
+        if by_ip >= SIGNIN_PER_IP_PER_HOUR:
+            raise HTTPException(429, "too many sign-in requests from this address; try later")
+
+    db.add(SigninAttempt(email=email, ip=ip))
+    db.commit()
 
     token, expires = signin.new_token()
     db.add(SigninToken(token=token, email=email, expires_at=expires))
