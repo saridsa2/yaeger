@@ -1,17 +1,39 @@
 {
-  "name": "@saridsa2/yaeger-pi",
+  "name": "yaeger-pi",
   "version": "0.1.0",
   "description": "Run open-weight models on your own Modal account from inside pi, shared across a team",
   "license": "Apache-2.0",
   "type": "module",
-  "keywords": ["pi-package", "pi", "modal", "vllm", "llm", "self-hosted", "sovereign"],
-  "repository": { "type": "git", "url": "git+https://github.com/saridsa2/yaeger.git" },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "modal",
+    "vllm",
+    "llm",
+    "self-hosted",
+    "sovereign"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/saridsa2/yaeger.git"
+  },
   "homepage": "https://github.com/saridsa2/yaeger#readme",
-  "bugs": { "url": "https://github.com/saridsa2/yaeger/issues" },
-  "engines": { "node": ">=22" },
-  "files": ["extensions", "schema", "README.md", "LICENSE"],
+  "bugs": {
+    "url": "https://github.com/saridsa2/yaeger/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "extensions",
+    "schema",
+    "README.md",
+    "LICENSE"
+  ],
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": [
+      "./extensions"
+    ]
   },
   "dependencies": {
     "modal": "^0.9.0"
