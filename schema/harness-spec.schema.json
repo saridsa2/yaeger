@@ -1,0 +1,178 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://modalpi.dev/schema/harness-spec-v1.json",
+  "title": "modalpi harness spec",
+  "description": "The contract between the modalpi service and the plugin. The service returns this; the plugin renders it through a vetted local template into a Modal deployment file. Deliberately data-only: no code, no shell strings, nothing the plugin will execute verbatim.",
+  "type": "object",
+  "required": ["spec_version", "tier", "model", "hardware", "engine", "serving"],
+  "additionalProperties": false,
+  "properties": {
+    "spec_version": { "const": 1 },
+
+    "tier": {
+      "description": "How this spec was resolved. Surfaced to the user so they know whether they are getting a proven harness or a fresh guess.",
+      "type": "string",
+      "enum": ["exact", "near", "cold"]
+    },
+
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "harness_id": { "type": "string" },
+        "verified": {
+          "type": "boolean",
+          "description": "True only if this exact spec has booted successfully at least once."
+        },
+        "boot_count": { "type": "integer", "minimum": 0 },
+        "derived_from": {
+          "type": "string",
+          "description": "harness_id this was adapted from, for tier=near."
+        },
+        "kb_entries_applied": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "KB entry ids folded into this spec, so a failure can be traced to the rule that produced it."
+        }
+      }
+    },
+
+    "model": {
+      "type": "object",
+      "required": ["repo"],
+      "additionalProperties": false,
+      "properties": {
+        "repo": { "type": "string", "description": "Hugging Face repo id." },
+        "revision": { "type": "string", "default": "main" },
+        "architecture": {
+          "type": "string",
+          "description": "From config.json architectures[0], e.g. Qwen3NextForCausalLM. Drives KB matching."
+        },
+        "family": { "type": "string", "description": "Coarse grouping used for tier-2 adaptation, e.g. qwen3.8." },
+        "quantization": {
+          "type": "string",
+          "enum": ["none", "fp8", "nvfp4", "awq", "gptq", "mxfp4"],
+          "default": "none"
+        },
+        "gated": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true the plugin must prompt for an HF token before deploying."
+        }
+      }
+    },
+
+    "hardware": {
+      "type": "object",
+      "required": ["gpu", "count"],
+      "additionalProperties": false,
+      "properties": {
+        "gpu": {
+          "type": "string",
+          "enum": ["T4", "A10", "L40S", "A100-40GB", "A100-80GB", "H100", "H200", "B200"]
+        },
+        "count": { "type": "integer", "minimum": 1, "maximum": 8 },
+        "est_weights_gb": { "type": "number", "minimum": 0 },
+        "est_usd_per_hour": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Computed server-side from a real price table, never by the model. Shown to the user before they approve the deploy."
+        }
+      }
+    },
+
+    "engine": {
+      "type": "object",
+      "required": ["name", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "enum": ["vllm", "sglang"] },
+        "version": { "type": "string", "description": "Exact pin, e.g. 0.27.1." },
+        "cuda_image": { "type": "string", "default": "nvidia/cuda:12.9.0-devel-ubuntu22.04" },
+        "image": {
+          "type": "string",
+          "description": "Runnable image containing the engine, used for the Sandbox path (e.g. vllm/vllm-openai:v0.27.1). Unlike cuda_image this needs no build step."
+        },
+        "clear_entrypoint": {
+          "type": "boolean",
+          "default": true,
+          "description": "Clear the image ENTRYPOINT before running the command. vllm/vllm-openai ships ENTRYPOINT [\"vllm\",\"serve\"], which double-invokes an explicit command. See KB vllm-image-entrypoint."
+        },
+        "python_version": { "type": "string", "default": "3.12" },
+        "extra_packages": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Additional pip specs. Kept as a list so the renderer quotes each one; never a joined command string."
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Container env vars, e.g. VLLM_USE_V1."
+        }
+      }
+    },
+
+    "serving": {
+      "type": "object",
+      "required": ["max_model_len"],
+      "additionalProperties": false,
+      "properties": {
+        "served_model_name": { "type": "string" },
+        "max_model_len": { "type": "integer", "minimum": 1024 },
+        "max_num_seqs": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Must be set explicitly for hybrid recurrent architectures; vLLM's CUDA default of 1024 exceeds available Mamba cache blocks on smaller cards. See KB gdn-max-num-seqs."
+        },
+        "kv_cache_dtype": { "type": "string", "enum": ["auto", "fp8"], "default": "auto" },
+        "enable_prefix_caching": { "type": "boolean", "default": true },
+        "tool_call_parser": {
+          "type": "string",
+          "description": "Must match what the model's chat template actually emits, not the family default. Qwen3.8 emits XML, so hermes silently mis-parses every call."
+        },
+        "reasoning_parser": { "type": "string" },
+        "enable_auto_tool_choice": { "type": "boolean", "default": true },
+        "extra_flags": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Escape hatch for cases the schema does not cover. Each element is one argv token; the renderer never splits on whitespace.",
+          "default": []
+        }
+      }
+    },
+
+    "modal": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "app_name": { "type": "string" },
+        "scaledown_window_s": { "type": "integer", "minimum": 60, "default": 300 },
+        "startup_timeout_s": { "type": "integer", "minimum": 60, "default": 1200 },
+        "max_containers": { "type": "integer", "minimum": 1, "default": 1 },
+        "target_concurrency": { "type": "integer", "minimum": 1, "default": 8 }
+      }
+    },
+
+    "client": {
+      "type": "object",
+      "description": "How the plugin should register this endpoint with pi once it is live.",
+      "additionalProperties": false,
+      "properties": {
+        "context_window": { "type": "integer" },
+        "max_tokens": { "type": "integer" },
+        "reasoning": { "type": "boolean" },
+        "compat": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "pi models.json compat block, e.g. supportsDeveloperRole:false, thinkingFormat:qwen-chat-template."
+        }
+      }
+    },
+
+    "warnings": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Human-readable caveats shown before deploy, e.g. 'this architecture has never been verified on this GPU'."
+    }
+  }
+}

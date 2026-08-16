@@ -1,0 +1,19 @@
+# secrets and local state - never commit
+.env
+*.db
+*.db-journal
+yaeger-auth.json
+*.key
+*.pem
+
+# dependencies and build output
+node_modules/
+venv/
+.venv/
+__pycache__/
+*.pyc
+dist/
+
+# editor / OS
+.DS_Store
+*.swp

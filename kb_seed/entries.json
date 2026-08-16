@@ -1,0 +1,252 @@
+[
+  {
+    "id": "gdn-max-num-seqs",
+    "title": "Hybrid Gated-DeltaNet models exhaust Mamba cache blocks at vLLM's default max_num_seqs",
+    "category": "serving",
+    "applies_to": {
+      "engine": "vllm",
+      "engine_version_range": ">=0.17.0",
+      "platform": "cuda",
+      "architectures": [
+        "Qwen3NextForCausalLM",
+        "Qwen3_5ForConditionalGeneration"
+      ],
+      "traits": [
+        "hybrid_gdn",
+        "linear_attention"
+      ]
+    },
+    "symptom": {
+      "error_regex": "max_num_seqs \\((\\d+)\\) exceeds available Mamba cache blocks \\((\\d+)\\)",
+      "phase": "engine_init",
+      "silent": false,
+      "description": "Engine core initialization fails during CUDA graph capture. The model loads and the KV cache is sized successfully first, which makes it look like a memory problem rather than a config one."
+    },
+    "cause": "Each decode sequence in a hybrid GDN model needs its own Mamba recurrent-state block. vLLM's CUDA default of max_num_seqs=1024 exceeds the number of blocks that fit alongside the weights, so CUDA graph capture cannot proceed.",
+    "fix": {
+      "spec_patch": {
+        "serving": {
+          "max_num_seqs": 256
+        }
+      },
+      "notes": "Set max_num_seqs at or below the block count reported in the error. 256 is comfortably clear on an 80GB card and is ample for interactive/agent use. Raising gpu_memory_utilization is the alternative lever but trades away KV cache."
+    },
+    "confidence": "verified",
+    "source": "modalpi first-party: Qwen/Qwen3.8-27B-FP8 on H100:1, vLLM 0.27.1, 2026-08-16 (architecture string verified against the HF API)",
+    "verified_on": [
+      "Qwen/Qwen3.8-27B-FP8 @ H100:1"
+    ]
+  },
+  {
+    "id": "hf-hub-pin-conflict",
+    "title": "Pinning huggingface_hub alongside modern vLLM makes the image unresolvable",
+    "category": "packaging",
+    "applies_to": {
+      "engine": "vllm",
+      "engine_version_range": ">=0.27.0",
+      "platform": "any"
+    },
+    "symptom": {
+      "error_regex": "No solution found when resolving dependencies|depends on huggingface-hub>=",
+      "phase": "image_build",
+      "silent": false,
+      "description": "Image build fails before anything runs. Common because several widely-copied Modal examples pin huggingface_hub==0.34.4."
+    },
+    "cause": "vLLM >=0.27 requires transformers >=5.5.3, which requires huggingface-hub >=1.5.0. Any pin below that is unsatisfiable.",
+    "fix": {
+      "spec_patch": {
+        "engine": {
+          "extra_packages": [
+            "hf_transfer"
+          ]
+        }
+      },
+      "notes": "Do not pin huggingface_hub at all; let vLLM resolve it. Install hf_transfer separately if fast downloads are wanted. Never copy dependency pins from an older example without re-resolving."
+    },
+    "confidence": "verified",
+    "source": "modalpi first-party: Modal image build, vLLM 0.27.1, 2026-08-16",
+    "verified_on": [
+      "nvidia/cuda:12.9.0-devel-ubuntu22.04 + vllm==0.27.1"
+    ]
+  },
+  {
+    "id": "qwen38-xml-tool-parser",
+    "title": "Qwen3.8 emits XML tool calls, so the hermes parser silently mis-parses every call",
+    "category": "serving",
+    "applies_to": {
+      "engine": "vllm",
+      "platform": "any",
+      "model_regex": "(?i)qwen3\\.8|qwen3-coder",
+      "traits": [
+        "xml_tool_calls"
+      ]
+    },
+    "symptom": {
+      "error_regex": null,
+      "phase": "runtime",
+      "silent": true,
+      "description": "No error anywhere. The server starts, requests succeed, but tool_calls comes back empty and the raw XML appears in message.content instead. Agents built on the endpoint simply never call tools."
+    },
+    "cause": "The Qwen3.8 chat template emits <tool_call><function=name><parameter=x> XML, not the JSON body that the hermes parser expects. hermes is the usual Qwen default, which makes this an easy wrong guess.",
+    "fix": {
+      "spec_patch": {
+        "serving": {
+          "tool_call_parser": "qwen3_xml",
+          "reasoning_parser": "qwen3"
+        }
+      },
+      "notes": "Verify by grepping the model's chat_template.jinja for '<function=' before choosing. qwen3_coder and qwen3_xml both map to the same parser class. This class of bug cannot be caught by a boot check - only by asserting a real tool call parses into structured tool_calls."
+    },
+    "confidence": "verified",
+    "source": "modalpi first-party: chat_template.jinja inspection + live tool-call assertion, 2026-08-16",
+    "verified_on": [
+      "mlx-community/Qwen3.8-27B-4bit",
+      "Qwen/Qwen3.8-27B-FP8"
+    ]
+  },
+  {
+    "id": "vllm-metal-gdn-corruption",
+    "title": "vllm-metal's GDN kernel injects foreign-language garbage tokens on Apple Silicon",
+    "category": "quality",
+    "applies_to": {
+      "engine": "vllm",
+      "platform": "metal",
+      "engine_version_range": "vllm-metal <=0.3.0.dev",
+      "traits": [
+        "hybrid_gdn"
+      ]
+    },
+    "symptom": {
+      "error_regex": null,
+      "phase": "runtime",
+      "silent": true,
+      "description": "Output is fluent and correct-looking but contains occasional tokens from unrelated languages, roughly 1 per 1,100 characters. Survives top_k=20, which rules out tail sampling: the junk ranks inside the model's top 20."
+    },
+    "cause": "Defect in vllm-metal's Metal Gated-DeltaNet kernel. Same class as sgl-project/sglang#22087, which affects dense GDN models only and is explicitly not quantization-dependent.",
+    "fix": {
+      "spec_patch": null,
+      "notes": "No flag fixes this. Both attention paths are affected and chunked prefill does not clear it. Serve GDN models on Apple Silicon with mlx_lm.server instead, or move to CUDA. Proven by elimination: identical 4-bit weights produce 0 garbage through mlx_lm and through vLLM on an H100, and 10 through vllm-metal over comparable volume."
+    },
+    "confidence": "verified",
+    "source": "modalpi first-party: four-way A/B across vllm-metal paged, non-paged, mlx_lm, and CUDA H100, 2026-08-16",
+    "verified_on": [
+      "mlx-community/Qwen3.8-27B-4bit @ M5 Max"
+    ]
+  },
+  {
+    "id": "mxfp4-not-on-nvidia",
+    "title": "MXFP4 checkpoints do not load on NVIDIA devices",
+    "category": "packaging",
+    "applies_to": {
+      "engine": "vllm",
+      "platform": "cuda",
+      "quantization": "mxfp4"
+    },
+    "symptom": {
+      "error_regex": "linear method|MXFP4",
+      "phase": "model_load",
+      "silent": false,
+      "description": "Model fails to load due to missing linear method support."
+    },
+    "cause": "vLLM has no MXFP4 linear method for NVIDIA backends.",
+    "fix": {
+      "spec_patch": {
+        "model": {
+          "quantization": "nvfp4"
+        }
+      },
+      "notes": "Use an NVFP4 build instead on Blackwell-class hardware, or FP8 on Hopper. Check that an NVFP4 conversion of the target model actually exists before recommending it."
+    },
+    "confidence": "documented",
+    "source": "vLLM recipes: Qwen/Qwen3.8-27B known issues",
+    "verified_on": []
+  },
+  {
+    "id": "modal-server-decorator-shape",
+    "title": "Modal's @app.server() must decorate a class with @modal.enter(), not a function",
+    "category": "platform",
+    "applies_to": {
+      "engine": "any",
+      "platform": "modal",
+      "engine_version_range": "modal >=1.5"
+    },
+    "symptom": {
+      "error_regex": "The @app\\.server\\(\\) decorator must be used on a class",
+      "phase": "deploy",
+      "silent": false,
+      "description": "Deploy aborts immediately with a TypeError, before any container starts."
+    },
+    "cause": "Published Modal vLLM examples show a function-shaped @app.server(); the 1.5.x client requires a class exposing an @modal.enter() setup method.",
+    "fix": {
+      "spec_patch": null,
+      "notes": "Renderer-level concern, not a spec field: the template must emit a class with @modal.enter(). Keep this entry so the diagnoser recognises the error if a user hand-edits their harness."
+    },
+    "confidence": "verified",
+    "source": "modalpi first-party: modal client 1.5.4, 2026-08-16",
+    "verified_on": [
+      "modal==1.5.4"
+    ]
+  },
+  {
+    "id": "gdn-prefix-caching-excludes-spec-decode",
+    "title": "Hybrid GDN models cannot combine prefix caching with speculative decoding",
+    "category": "serving",
+    "applies_to": {
+      "engine": "vllm",
+      "platform": "metal",
+      "traits": [
+        "hybrid_gdn"
+      ]
+    },
+    "symptom": {
+      "error_regex": "Prefix caching for hybrid GDN models .* does not support speculative decoding",
+      "phase": "engine_init",
+      "silent": false,
+      "description": "Engine refuses to start when both are enabled."
+    },
+    "cause": "Draft-state rollback across Mamba state blocks is not implemented, so the two features are mutually exclusive.",
+    "fix": {
+      "spec_patch": {
+        "serving": {
+          "enable_prefix_caching": true
+        }
+      },
+      "notes": "Choose prefix caching over speculative decoding for agent workloads, where long prompts repeat and cache hit rates are high (measured 42.5% in a multi-turn pi session). Drop the MTP drafter model in that case."
+    },
+    "confidence": "verified",
+    "source": "modalpi first-party: vllm_metal platform.py validation + live session metrics, 2026-08-16",
+    "verified_on": [
+      "mlx-community/Qwen3.8-27B-4bit @ M5 Max"
+    ]
+  },
+  {
+    "id": "vllm-image-entrypoint",
+    "title": "vllm/vllm-openai image has an ENTRYPOINT, so an explicit command is double-invoked",
+    "category": "platform",
+    "applies_to": {
+      "engine": "vllm",
+      "platform": "modal-sandbox",
+      "image_regex": "vllm/vllm-openai"
+    },
+    "symptom": {
+      "error_regex": "unrecognized arguments: serve|usage: vllm \\[-h\\]",
+      "phase": "container_start",
+      "silent": false,
+      "description": "The container exits immediately with exit code 2. vLLM prints its top-level usage and rejects 'serve <model>' as unrecognized arguments, which reads like a bad flag rather than a duplicated invocation."
+    },
+    "cause": "The image sets ENTRYPOINT [\"vllm\",\"serve\"]. A sandbox command of [\"vllm\",\"serve\",...] is appended to it, so the process actually runs `vllm serve vllm serve <model> ...`.",
+    "fix": {
+      "spec_patch": {
+        "engine": {
+          "clear_entrypoint": true
+        }
+      },
+      "notes": "Clear it with dockerfileCommands([\"ENTRYPOINT []\"]) before creating the sandbox, then pass the full command. Applies to any image with a baked-in ENTRYPOINT, not just vLLM's."
+    },
+    "confidence": "verified",
+    "source": "yaeger-pi first-party: Modal Sandbox via the TS SDK, vllm/vllm-openai:v0.27.1, 2026-08-16",
+    "verified_on": [
+      "Qwen/Qwen3.8-27B-FP8 @ H100 sandbox"
+    ]
+  }
+]
