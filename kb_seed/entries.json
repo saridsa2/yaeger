@@ -248,5 +248,77 @@
     "verified_on": [
       "Qwen/Qwen3.8-27B-FP8 @ H100 sandbox"
     ]
+  },
+  {
+    "id": "minimax-m3-not-in-stable-vllm",
+    "title": "MiniMax-M3 is not served by stable vLLM releases",
+    "category": "packaging",
+    "applies_to": {
+      "engine": "vllm",
+      "platform": "any",
+      "architectures": [
+        "MiniMaxM3SparseForConditionalGeneration"
+      ]
+    },
+    "symptom": {
+      "error_regex": "not a supported architecture|Model architectures \\[.*MiniMaxM3.*\\] are not supported",
+      "phase": "model_load",
+      "silent": false,
+      "description": "vLLM refuses the checkpoint at load time because the architecture is unknown to the release."
+    },
+    "cause": "M3's sparse architecture landed after the current stable vLLM release; support ships in a model-specific image rather than on PyPI.",
+    "fix": {
+      "spec_patch": null,
+      "notes": "Use the MiniMax-published vLLM image for M3 rather than vllm/vllm-openai, and set engine.image accordingly. Check the model card for the current tag before deploying - this entry ages quickly."
+    },
+    "confidence": "documented",
+    "source": "MiniMax M3 deployment guidance, checked 2026-08-16",
+    "verified_on": []
+  },
+  {
+    "id": "multi-gpu-needs-tensor-parallel",
+    "title": "Multi-GPU harnesses must set --tensor-parallel-size or the model will not fit",
+    "category": "serving",
+    "applies_to": {
+      "engine": "vllm",
+      "platform": "any"
+    },
+    "symptom": {
+      "error_regex": "No available memory for the cache blocks|CUDA out of memory|does not fit",
+      "phase": "model_load",
+      "silent": false,
+      "description": "Reserving four GPUs and getting an out-of-memory failure looks like a sizing mistake. It is not: vLLM defaults to tensor-parallel-size 1 and tries to load the whole model onto one card, leaving the other three idle."
+    },
+    "cause": "vLLM does not infer tensor parallelism from the number of visible GPUs.",
+    "fix": {
+      "spec_patch": null,
+      "notes": "The renderer emits --tensor-parallel-size from hardware.count whenever it exceeds 1. Tensor parallel wants a power of two, so 2/4/8 are the usable counts."
+    },
+    "confidence": "verified",
+    "source": "yaeger-pi first-party: argv construction, 2026-08-16",
+    "verified_on": []
+  },
+  {
+    "id": "model-too-large-for-one-node",
+    "title": "Trillion-parameter checkpoints exceed a single Modal sandbox",
+    "category": "platform",
+    "applies_to": {
+      "engine": "any",
+      "platform": "modal-sandbox"
+    },
+    "symptom": {
+      "error_regex": null,
+      "phase": "planning",
+      "silent": true,
+      "description": "There is no error - the resolver simply cannot produce a working configuration, and a naive sizer would return an 8-GPU spec that cannot possibly load the weights."
+    },
+    "cause": "One sandbox reserves at most 8 GPUs. 8xH200 is 1,128GB, and DeepSeek-V4-Pro alone is ~1,600GB at FP8 before any KV cache.",
+    "fix": {
+      "spec_patch": null,
+      "notes": "Refuse with the arithmetic shown rather than emitting a spec that burns GPU minutes before failing. Serve a quantised build (NVFP4 roughly halves it) or a smaller variant such as DeepSeek-V4-Flash."
+    },
+    "confidence": "verified",
+    "source": "yaeger-pi first-party: resolver sizing against real HF parameter counts, 2026-08-16",
+    "verified_on": []
   }
 ]

@@ -71,13 +71,31 @@ def pick_gpu(weights_gb: float | None, preferred: str | None = None) -> tuple[st
         return "H100", 1
 
     need = weights_gb * 1.4
+
+    # Single card first - cheapest per hour and no tensor-parallel overhead.
     for gpu in ["L40S", "A100-80GB", "H100", "H200", "B200"]:
         if GPU_VRAM[gpu] >= need:
             return gpu, 1
-    for count in (2, 4, 8):
-        if GPU_VRAM["H100"] * count >= need:
-            return "H100", count
-    return "H200", 8
+
+    # Multi-GPU. Tensor parallel wants a power of two, so counts are 2/4/8.
+    # Pick the cheapest combination that fits rather than defaulting to H100:
+    # for large MoE models 4xH200 is both cheaper and roomier than 8xH100.
+    options = [
+        (gpu, count)
+        for gpu in ["H100", "H200", "B200"]
+        for count in (2, 4, 8)
+        if GPU_VRAM[gpu] * count >= need
+    ]
+    if options:
+        return min(options, key=lambda o: GPU_PRICES[o[0]] * o[1])
+
+    # Nothing available fits. Say so rather than returning a config that
+    # cannot possibly boot - 8 GPUs is the ceiling for a single Modal sandbox.
+    raise ValueError(
+        f"needs about {need:.0f}GB with headroom, which exceeds the largest "
+        f"single-node configuration available (8x B200 = {GPU_VRAM['B200'] * 8}GB). "
+        "Serve a quantised build, or use a smaller variant."
+    )
 
 
 def price(gpu: str, count: int) -> float:

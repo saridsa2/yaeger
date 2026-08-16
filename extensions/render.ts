@@ -120,6 +120,12 @@ export function buildArgv(spec: HarnessSpec): string[] {
     String(Math.floor(s.max_model_len)),
   ];
 
+  // Multi-GPU needs tensor parallelism explicitly: vLLM defaults to TP=1 and
+  // will simply fail to fit the model rather than sharding it. Every harness
+  // with hardware.count > 1 is unservable without this.
+  const gpuCount = Math.max(1, Math.floor(spec.hardware.count ?? 1));
+  if (gpuCount > 1) argv.push("--tensor-parallel-size", String(gpuCount));
+
   if (s.max_num_seqs != null) argv.push("--max-num-seqs", String(Math.floor(s.max_num_seqs)));
   if (s.kv_cache_dtype && s.kv_cache_dtype !== "auto") {
     argv.push("--kv-cache-dtype", assertSafe("kv_cache_dtype", s.kv_cache_dtype));
