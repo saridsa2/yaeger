@@ -41,7 +41,16 @@ import {
   type CatalogEntry,
 } from "./client.ts";
 import { buildArgv, servedModelName, type HarnessSpec } from "./render.ts";
-import { launch, listRunning, modalConfigured, readTraces, stop, type Launched } from "./sandbox.ts";
+import {
+  launch,
+  listRunning,
+  modalConfigured,
+  readTraces,
+  sandboxesToReap,
+  stop,
+  type Launched,
+  type ReapPolicy,
+} from "./sandbox.ts";
 import { renderEconomics, renderInsights } from "./teamview.ts";
 
 const execFileAsync = promisify(execFile);
@@ -187,13 +196,14 @@ function storeApiKey(key: string): void {
 async function launchWithRepair(
   spec: HarnessSpec,
   onUpdate?: (s: string) => void,
+  reap: ReapPolicy = "exit",
 ): Promise<{ spec: HarnessSpec; launched: Launched; repaired: string | null }> {
   let current = spec;
   let repaired: string | null = null;
 
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      const launched = await launch(current, { onUpdate });
+      const launched = await launch(current, { onUpdate, reap });
       return { spec: current, launched, repaired };
     } catch (err) {
       const raw = String((err as Error).message ?? err);
@@ -449,7 +459,8 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(
           `Running at ${launched.url}` +
             (repaired ? ` (auto-fixed ${repaired})` : "") +
-            `. Select it with /model. ~$${launched.usdPerHour}/hr - /yaeger-stop when done.`,
+            `. Select it with /model. ~$${launched.usdPerHour}/hr - /yaeger-stop when done,` +
+            ` or just quit pi and it stops itself.`,
           "info",
         );
       } catch (e) {
@@ -541,7 +552,25 @@ export default function (pi: ExtensionAPI) {
         );
         if (!ok) return ctx.ui.notify("Cancelled.", "info");
 
-        const { spec: finalSpec, launched } = await launchWithRepair(spec, (m) => ctx.ui.notify(m, "info"));
+        // Asked here, not on the way out: pi tears the TUI down before
+        // session_shutdown fires, so a dialog at exit has nothing to draw on.
+        // Default is to leave a shared endpoint up - the owner quitting is not
+        // the team finishing, and members may be mid-request.
+        let reap: ReapPolicy = "keep";
+        if (ctx.hasUI) {
+          const stopOnExit = await ctx.ui.confirm?.(
+            "Stop this endpoint when you quit pi?",
+            "No - leave it up for the team (members keep working; you keep paying).\n" +
+              "Yes - stop it when you quit (halts billing; members lose the endpoint).",
+          );
+          reap = stopOnExit ? "exit" : "keep";
+        }
+
+        const { spec: finalSpec, launched } = await launchWithRepair(
+          spec,
+          (m) => ctx.ui.notify(m, "info"),
+          reap,
+        );
         await publishTeamEndpoint(teamId, {
           url: launched.url,
           key: launched.apiKey,
@@ -555,7 +584,10 @@ export default function (pi: ExtensionAPI) {
         registerProvider(finalSpec, launched.url, launched.apiKey);
         ctx.ui.notify(
           `Team endpoint live: ${launched.url}\n` +
-            `Members can now run /yaeger-team-use ${teamId}. ~$${launched.usdPerHour}/hr while up.`,
+            `Members can now run /yaeger-team-use ${teamId}. ~$${launched.usdPerHour}/hr while up.\n` +
+            (reap === "exit"
+              ? "Stops automatically when you quit pi."
+              : "Stays up after you quit - /yaeger-team-stop to halt billing."),
           "info",
         );
       } catch (e) {
@@ -741,5 +773,120 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(`Stop failed: ${(e as Error).message}`, "error");
       }
     },
+  });
+
+  // ------------------------------------------------- GPU lifecycle safety
+  //
+  // A GPU bills whether or not anyone is using it, so an endpoint that outlives
+  // the session that started it is a silent bill. Two halves cover that:
+  //
+  //   session_shutdown  a clean quit stops anything tagged reap=exit. Cannot
+  //                     prompt: pi stops the TUI before this event fires.
+  //   session_start     a sweep at startup catches everything the first half
+  //                     cannot - SIGKILL, a crash, a closed laptop, a boot
+  //                     interrupted before launch() ever returned. The TUI is
+  //                     alive here, so this is where a human gets asked.
+
+  /** Never let a Modal round-trip hold up starting or quitting pi. */
+  async function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        p,
+        new Promise<T>((resolve) => {
+          timer = setTimeout(() => resolve(fallback), ms);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  pi.on("session_start", async (_event, ctx) => {
+    // No Modal credentials means nothing of ours can be running.
+    if (await modalConfigured()) return;
+
+    const running = await withTimeout(listRunning(), 5_000, [] as Awaited<
+      ReturnType<typeof listRunning>
+    >);
+    if (!running.length) return;
+
+    const summary = running
+      .map((r) => `  ${r.model}  ${r.sandboxId}${r.reap === "keep" ? "  (shared)" : ""}`)
+      .join("\n");
+
+    // Print and JSON modes have nothing to ask with, and notify is a no-op there.
+    // Stay silent rather than stopping a GPU nobody asked us to stop, or writing
+    // stray lines into scripted output. The next interactive session sweeps it.
+    if (!ctx.hasUI) return;
+
+    const stopThem = await ctx.ui.confirm?.(
+      `${running.length} GPU sandbox(es) from an earlier session are still billing`,
+      `${summary}\n\nStop them now?`,
+    );
+    if (!stopThem) {
+      return ctx.ui.notify("Left running. /yaeger-stop when you want them gone.", "info");
+    }
+
+    const failed: string[] = [];
+    for (const r of running) {
+      try {
+        await stop(r.sandboxId);
+      } catch {
+        failed.push(r.sandboxId);
+      }
+    }
+    ctx.ui.notify(
+      failed.length
+        ? `Stopped ${running.length - failed.length}. Could not stop: ${failed.join(", ")}`
+        : `Stopped ${running.length} sandbox(es). Billing halted.`,
+      failed.length ? "warning" : "info",
+    );
+  });
+
+  pi.on("session_shutdown", async (event) => {
+    // Only a real quit. A reload, fork or session switch is not the user leaving,
+    // and killing a GPU on /compact would be a nasty surprise.
+    if (event.reason !== "quit") return;
+    if (await modalConfigured()) return;
+
+    const running = await withTimeout(listRunning(), 5_000, [] as Awaited<
+      ReturnType<typeof listRunning>
+    >);
+    const doomed = sandboxesToReap(running, event.reason);
+    if (!doomed.length) return;
+
+    // Settle per sandbox so one failure does not hide the rest, and so a slow
+    // Modal call cannot hold the quit open indefinitely. `null` marks a stop we
+    // never got an answer for - reported as unstopped, because assuming success
+    // is how a GPU keeps billing unnoticed.
+    const outcomes = await Promise.all(
+      doomed.map((d) =>
+        withTimeout(
+          stop(d.sandboxId).then(
+            () => true,
+            () => false,
+          ),
+          10_000,
+          null as boolean | null,
+        ),
+      ),
+    );
+
+    const left = doomed.filter((_, i) => outcomes[i] !== true).map((d) => d.sandboxId);
+    const stopped = doomed.length - left.length;
+
+    // The TUI is gone by now, so ui.notify cannot render. stdout still works -
+    // it is how pi prints its own resume hint - and an unreaped GPU is worth a
+    // line the user can act on.
+    if (left.length) {
+      process.stdout.write(
+        `yaeger: could not stop ${left.length} GPU sandbox(es) - still billing. ` +
+          `Run: pi, then /yaeger-stop ${left.join(" ")}\n`,
+      );
+    }
+    if (stopped) {
+      process.stdout.write(`yaeger: stopped ${stopped} GPU sandbox(es). Billing halted.\n`);
+    }
   });
 }

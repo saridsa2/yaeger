@@ -14,9 +14,13 @@
 import { randomBytes } from "node:crypto";
 import { ModalClient } from "modal";
 
-import { buildArgv, type HarnessSpec } from "./render.ts";
+import { parseReapTag, type ReapPolicy, type RunningSandbox } from "./reap.ts";
+import { assertPackageName, assertSafe, buildArgv, type HarnessSpec } from "./render.ts";
+
+export { sandboxesToReap, type ReapPolicy, type RunningSandbox } from "./reap.ts";
 
 const HF_CACHE_VOLUME = "huggingface-cache";
+const VLLM_CACHE_VOLUME = "vllm-cache";
 const TRACE_VOLUME = "yaeger-traces";
 const TRACE_DIR = "/traces";
 
@@ -56,6 +60,39 @@ export async function makeApiKeySecret(): Promise<{ secret: any; key: string }> 
   return { secret, key };
 }
 
+/**
+ * Environment for the serving container.
+ *
+ * `render.ts` has always applied `spec.engine.env` via `.env({...})`; the sandbox
+ * path dropped it, so a harness declaring HF_HUB_ENABLE_HF_TRANSFER or VLLM_USE_V1
+ * never got them. The harness is the authority on what the model needs, so spec
+ * values win over our defaults.
+ */
+export function buildEnv(spec: HarnessSpec): Record<string, string> {
+  const env: Record<string, string> = {
+    HF_XET_HIGH_PERFORMANCE: "1",
+    // Hypothesis under test, not a proven fix. vLLM derives its torch.compile
+    // cache directory from `safe_hash(str(factors))`, and we measured three
+    // different directories across three launches of an identical config - so
+    // something in that string is not stable per process. Python randomises str
+    // hashing per process, which reorders any set inside those factors. Pinning
+    // the seed costs nothing here (single-tenant container) and, if the theory
+    // holds, is what makes the compile cache reusable at all. Verify by booting
+    // twice and comparing the cache directory before trusting it.
+    PYTHONHASHSEED: "0",
+  };
+
+  // Unauthenticated HF pulls are rate-limited, which vLLM warns about on every
+  // cold boot. Opt-in: only forwarded if the user has a token in their own env.
+  const hfToken = process.env.HF_TOKEN ?? process.env.HUGGING_FACE_HUB_TOKEN;
+  if (hfToken) env.HF_TOKEN = hfToken;
+
+  for (const [k, v] of Object.entries(spec.engine.env ?? {})) {
+    env[assertSafe("env key", k)] = String(v);
+  }
+  return env;
+}
+
 export interface Launched {
   sandboxId: string;
   url: string;
@@ -76,9 +113,19 @@ export interface Launched {
  */
 export async function launch(
   spec: HarnessSpec,
-  opts: { onUpdate?: (s: string) => void; readyTimeoutMs?: number; trace?: boolean } = {},
+  opts: {
+    onUpdate?: (s: string) => void;
+    readyTimeoutMs?: number;
+    trace?: boolean;
+    reap?: ReapPolicy;
+  } = {},
 ): Promise<Launched> {
-  const { onUpdate, readyTimeoutMs = 15 * 60_000 } = opts;
+  // A first boot on an empty cache pays a full weight download before it even
+  // starts compiling, and expiry here terminates the sandbox - throwing away
+  // both the wait and the download. Overridable so a known-slow cold start can
+  // be given room without editing code.
+  const readyTimeoutDefault = Number(process.env.YAEGERPI_READY_TIMEOUT_MIN ?? "15") * 60_000;
+  const { onUpdate, readyTimeoutMs = readyTimeoutDefault } = opts;
   const c = client();
 
   const appName = `yaeger-${(spec.serving.served_model_name ?? spec.model.repo.split("/").pop()!)
@@ -99,13 +146,32 @@ export async function launch(
 
   onUpdate?.(`resolving image ${imageRef}...`);
   let image = await c.images.fromRegistry(imageRef);
+  const layers: string[] = [];
   if (spec.engine.clear_entrypoint !== false) {
     // vllm/vllm-openai ships ENTRYPOINT ["vllm","serve"]; an explicit command
     // gets appended to it and the process fails with "unrecognized arguments".
-    image = image.dockerfileCommands(["ENTRYPOINT []"]);
+    layers.push("ENTRYPOINT []");
   }
 
+  // render.ts installs these via uv_pip_install; the sandbox path used to drop
+  // them, so a harness asking for hf_transfer never got it.
+  //
+  // Validated as package names, not as argv tokens: the spec comes from the
+  // harness service, and a pip flag here (--index-url=http://attacker/) would
+  // run attacker code during the image build. `--` terminates option parsing as
+  // a second line of defence in case the grammar above ever loosens.
+  const extras = (spec.engine.extra_packages ?? []).map(assertPackageName);
+  if (extras.length) {
+    layers.push(`RUN pip install --no-cache-dir -- ${extras.join(" ")}`);
+  }
+  if (layers.length) image = image.dockerfileCommands(layers);
+
   const hfCache = await c.volumes.fromName(HF_CACHE_VOLUME, { createIfMissing: true });
+  // torch.compile artifacts, DeepGEMM autotune results and JIT-compiled kernels
+  // land here. Without it every boot re-pays several minutes of GPU warmup that
+  // no amount of weight caching avoids - render.ts has always declared this
+  // mount; the sandbox path was the one that dropped it.
+  const vllmCache = await c.volumes.fromName(VLLM_CACHE_VOLUME, { createIfMissing: true });
   const traceVol = await c.volumes.fromName(TRACE_VOLUME, { createIfMissing: true });
   const { secret, key: apiKey } = await makeApiKeySecret();
 
@@ -146,16 +212,29 @@ export async function launch(
     gpu,
     command,
     encryptedPorts: [8000],
-    volumes: { "/root/.cache/huggingface": hfCache, [TRACE_DIR]: traceVol },
+    volumes: {
+      "/root/.cache/huggingface": hfCache,
+      "/root/.cache/vllm": vllmCache,
+      [TRACE_DIR]: traceVol,
+    },
     secrets: [secret],
-    env: { HF_XET_HIGH_PERFORMANCE: "1" },
+    env: buildEnv(spec),
     idleTimeoutMs: idleMs,
     timeoutMs: maxMs,
   });
 
   // Tag it so /yaeger-status can find what this plugin started, without us
   // having to keep a local registry in sync.
-  await sb.setTags({ yaeger: "1", model: spec.model.repo.slice(0, 60) }).catch(() => {});
+  // Tagged before the ready-wait below, so a boot interrupted mid-wait - the
+  // session quitting, a crash, a closed laptop - is still discoverable and
+  // reapable. That window is exactly how an orphaned H100 runs to max_lifetime_s.
+  await sb
+    .setTags({
+      yaeger: "1",
+      model: spec.model.repo.slice(0, 60),
+      reap: opts.reap ?? "exit",
+    })
+    .catch(() => {});
 
   const tunnels = await sb.tunnels();
   const url = tunnels[8000]?.url;
@@ -210,10 +289,6 @@ export async function stop(sandboxId: string): Promise<void> {
   await sb.terminate();
 }
 
-export interface RunningSandbox {
-  sandboxId: string;
-  model: string;
-}
 
 /** What is alive right now, i.e. what is costing money. */
 export async function listRunning(): Promise<RunningSandbox[]> {
@@ -222,7 +297,11 @@ export async function listRunning(): Promise<RunningSandbox[]> {
   try {
     for await (const sb of c.sandboxes.list({ tags: { yaeger: "1" } })) {
       const tags = await (sb as any).getTags().catch(() => ({}));
-      out.push({ sandboxId: (sb as any).sandboxId, model: tags.model ?? "?" });
+      out.push({
+        sandboxId: (sb as any).sandboxId,
+        model: tags.model ?? "?",
+        reap: parseReapTag(tags.reap),
+      });
     }
   } catch {
     /* listing is advisory; never fail status over it */
